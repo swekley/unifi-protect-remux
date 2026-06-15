@@ -28,8 +28,13 @@
 			<array>
 				<string>public.data</string>
 			</array>
-			<key>UTTypeIconName</key>
-			<string>UBVDocument</string>
+			<key>UTTypeIcons</key>
+			<dict>
+				<key>UTTypeIconBadgeName</key>
+				<string>UBVIconBadge</string>
+				<key>UTTypeIconText</key>
+				<string>UBV</string>
+			</dict>
 			<key>UTTypeTagSpecification</key>
 			<dict>
 				<key>public.filename-extension</key>
