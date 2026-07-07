@@ -550,6 +550,120 @@ pub fn stream_to_mp4(
     Ok(())
 }
 
+/// Concatenate multiple MP4 files into a single output MP4 using FFmpeg's
+/// `concat` demuxer. This is a stream-copy operation — no re-encoding occurs.
+///
+/// The input files must have compatible stream layouts (same codecs, same number
+/// of streams). The concat demuxer handles timestamp continuation automatically.
+pub fn concat_mp4s(input_files: &[String], output_file: &str, fast_start: bool) -> io::Result<()> {
+    ensure_init();
+
+    if input_files.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "No input files to concatenate",
+        ));
+    }
+    if input_files.len() == 1 {
+        // Nothing to merge; just copy the single file
+        std::fs::copy(&input_files[0], output_file)?;
+        return Ok(());
+    }
+
+    // Write a temporary concat list file for the concat demuxer.
+    // Format: "file '/path/to/file.mp4'\n" per entry.
+    let concat_list_path = format!("{}.concat.txt", output_file);
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&concat_list_path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("Creating concat list file '{}': {}", concat_list_path, e),
+            )
+        })?;
+        for path in input_files {
+            // Use absolute paths to avoid issues with working directory.
+            // The single quotes inside the concat list escape special characters.
+            let abs_path = std::path::Path::new(path)
+                .canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from(path));
+            writeln!(f, "file '{}'", abs_path.display())?;
+        }
+    }
+
+    let result = do_concat(&concat_list_path, output_file, fast_start);
+
+    // Clean up the temporary concat list file regardless of result
+    let _ = std::fs::remove_file(&concat_list_path);
+
+    result
+}
+
+/// Inner concat logic, separated so cleanup happens uniformly.
+fn do_concat(concat_list_path: &str, output_file: &str, fast_start: bool) -> io::Result<()> {
+    // Open the concat list as an FFmpeg input with the concat demuxer
+    let mut opts = ffmpeg::Dictionary::new();
+    opts.set("safe", "0"); // Allow absolute paths
+    let mut ictx = format::input_with_dictionary(&concat_list_path, opts)
+        .map_err(ffmpeg_err("Opening concat input"))?;
+
+    // Create MP4 output
+    let mut octx =
+        format::output(&output_file).map_err(ffmpeg_err("Creating merged MP4 output file"))?;
+
+    // Copy stream definitions from input to output
+    let mut stream_mapping: Vec<usize> = Vec::new();
+    for (i, ist) in ictx.streams().enumerate() {
+        let mut ost = octx
+            .add_stream(encoder::find(codec::Id::None))
+            .map_err(ffmpeg_err("Adding stream to merged output"))?;
+        ost.set_parameters(ist.parameters());
+        // Preserve codec_tag from the input stream
+        unsafe {
+            let tag = (*ist.parameters().as_ptr()).codec_tag;
+            (*ost.parameters().as_mut_ptr()).codec_tag = tag;
+        }
+        stream_mapping.push(i);
+    }
+
+    // Copy metadata from input
+    let input_metadata = ictx.metadata().to_owned();
+    octx.set_metadata(input_metadata);
+
+    // Write header with options
+    if fast_start {
+        let mut header_opts = ffmpeg::Dictionary::new();
+        header_opts.set("movflags", "faststart");
+        octx.write_header_with(header_opts)
+            .map_err(ffmpeg_err("Writing merged MP4 header"))?;
+    } else {
+        octx.write_header()
+            .map_err(ffmpeg_err("Writing merged MP4 header"))?;
+    }
+
+    // Stream-copy all packets
+    for (stream, mut packet) in ictx.packets() {
+        let ist_index = stream.index();
+        if ist_index >= stream_mapping.len() {
+            continue;
+        }
+        let ost_index = stream_mapping[ist_index];
+        let ist_tb = stream.time_base();
+        let ost_tb = octx.stream(ost_index).unwrap().time_base();
+
+        packet.set_stream(ost_index);
+        packet.rescale_ts(ist_tb, ost_tb);
+        packet.set_position(-1);
+        packet
+            .write_interleaved(&mut octx)
+            .map_err(ffmpeg_err("Writing packet to merged output"))?;
+    }
+
+    octx.write_trailer()
+        .map_err(ffmpeg_err("Writing merged MP4 trailer"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

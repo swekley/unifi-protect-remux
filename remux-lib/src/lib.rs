@@ -29,6 +29,8 @@ pub struct RemuxConfig {
     /// Override the base output filename (without extension or timecode).
     /// When `None`, the base name is derived from the input .ubv filename.
     pub base_name: Option<String>,
+    /// When true, merge all per-partition MP4 outputs into a single MP4 file.
+    pub merge: bool,
 }
 
 impl Default for RemuxConfig {
@@ -42,6 +44,7 @@ impl Default for RemuxConfig {
             mp4: true,
             video_track: 0,
             base_name: None,
+            merge: false,
         }
     }
 }
@@ -97,6 +100,11 @@ pub fn validate_config(config: &RemuxConfig) -> Result<(), String> {
     if config.mp4 && !config.with_video {
         return Err(
             "MP4 output requires video; with_video=false is not supported with mp4=true".into(),
+        );
+    }
+    if config.merge && !config.mp4 {
+        return Err(
+            "--merge requires MP4 output; --mp4=false is not supported with --merge".into(),
         );
     }
     Ok(())
@@ -457,6 +465,63 @@ where
                     progress(ProgressEvent::OutputGenerated { path: path.clone() });
                     result.output_files.push(path.clone());
                 }
+            }
+        }
+    }
+
+    // Merge per-partition MP4s into a single output file if requested
+    if config.merge && config.mp4 && result.output_files.len() > 1 {
+        // Use the first output's filename as the base for the merged file.
+        // Individual partition files are named "{base}_{timecode}.mp4";
+        // the merged file keeps the first partition's name with a ".merged" suffix
+        // to avoid colliding, then we rename it after deleting the intermediates.
+        let first_output = &result.output_files[0];
+        let merged_path = first_output.clone();
+        let temp_merged = format!("{}.merging.mp4", merged_path.trim_end_matches(".mp4"));
+
+        progress(ProgressEvent::Log(
+            LogLevel::Info,
+            format!(
+                "Merging {} MP4 files into {}",
+                result.output_files.len(),
+                merged_path
+            ),
+        ));
+
+        match mp4mux::concat_mp4s(&result.output_files, &temp_merged, config.fast_start) {
+            Ok(()) => {
+                // Delete intermediate per-partition files
+                for path in &result.output_files {
+                    if let Err(e) = std::fs::remove_file(path) {
+                        progress(ProgressEvent::Log(
+                            LogLevel::Warn,
+                            format!("Failed to remove intermediate file {}: {}", path, e),
+                        ));
+                    }
+                }
+                // Rename temp merged file to the final name
+                if let Err(e) = std::fs::rename(&temp_merged, &merged_path) {
+                    progress(ProgressEvent::Log(
+                        LogLevel::Warn,
+                        format!(
+                            "Failed to rename {} to {}: {}",
+                            temp_merged, merged_path, e
+                        ),
+                    ));
+                    // Keep the temp file as the output
+                    result.output_files = vec![temp_merged.clone()];
+                } else {
+                    result.output_files = vec![merged_path.clone()];
+                }
+                progress(ProgressEvent::OutputGenerated {
+                    path: result.output_files[0].clone(),
+                });
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&temp_merged);
+                let err_msg = format!("Failed to merge MP4 files: {}", e);
+                progress(ProgressEvent::Log(LogLevel::Error, err_msg.clone()));
+                result.errors.push(err_msg);
             }
         }
     }

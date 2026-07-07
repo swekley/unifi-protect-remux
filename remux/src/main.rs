@@ -40,6 +40,10 @@ struct Args {
     #[arg(long = "fail-fast", default_value_t = false, action = ArgAction::Set)]
     fail_fast: bool,
 
+    /// Merge all per-partition MP4 outputs from a .ubv into a single MP4 file
+    #[arg(long = "merge", default_value_t = false, action = ArgAction::Set)]
+    merge: bool,
+
     /// Display version and quit
     #[arg(long = "version")]
     version: bool,
@@ -60,6 +64,7 @@ fn normalise_args(args: Vec<String>) -> Vec<String> {
         "-mp4",
         "-video-track",
         "-fail-fast",
+        "-merge",
         "-version",
     ];
 
@@ -158,6 +163,12 @@ fn validate_args(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    if args.merge && !args.mp4 {
+        return Err(
+            "--merge requires MP4 output; --mp4=false is not supported with --merge".into(),
+        );
+    }
+
     Ok(())
 }
 
@@ -171,6 +182,7 @@ fn args_to_config(args: &Args) -> RemuxConfig {
         mp4: args.mp4,
         video_track: args.video_track,
         base_name: None,
+        merge: args.merge,
     }
 }
 
@@ -297,6 +309,7 @@ mod tests {
             mp4: true,
             video_track: 0,
             fail_fast: false,
+            merge: false,
             version: false,
             files: vec!["dummy.ubv".to_string()],
         }
