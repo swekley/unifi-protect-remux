@@ -1,6 +1,8 @@
 use std::path::Path;
+use std::sync::Mutex;
 
 use clap::{ArgAction, Parser};
+use rayon::prelude::*;
 
 use remux_lib::{LogLevel, ProgressEvent, RemuxConfig};
 
@@ -43,6 +45,10 @@ struct Args {
     /// Merge all per-partition MP4 outputs from a .ubv into a single MP4 file
     #[arg(long = "merge", default_value_t = false, action = ArgAction::Set)]
     merge: bool,
+
+    /// Number of parallel jobs (default is number of CPUs)
+    #[arg(short = 'j', long = "jobs")]
+    jobs: Option<usize>,
 
     /// Display version and quit
     #[arg(long = "version")]
@@ -99,7 +105,7 @@ fn main() {
     }
 }
 
-fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+fn run(args: &Args) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if args.version {
         ubv::version::print_cli_version_banner(
             "UBV Remux Tool",
@@ -110,6 +116,15 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     validate_args(args)?;
+
+    // Configure rayon thread pool if jobs is specified
+    if let Some(jobs) = args.jobs {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(jobs)
+            .build_global()
+            .ok(); // ok() because it might already be initialized in tests
+    }
+
     remux_cli(args)
 }
 
@@ -148,7 +163,7 @@ fn expand_globs(patterns: &[String]) -> Vec<String> {
     result
 }
 
-fn validate_args(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+fn validate_args(args: &Args) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if args.files.is_empty() {
         return Err("Expected at least one .ubv file as input!".into());
     }
@@ -187,21 +202,22 @@ fn args_to_config(args: &Args) -> RemuxConfig {
 }
 
 /// Forward a ProgressEvent to the log crate.
-fn log_progress(event: ProgressEvent) {
+fn log_progress(ubv_path: &str, event: ProgressEvent) {
+    let prefix = format!("[{}] ", Path::new(ubv_path).file_name().unwrap_or_default().to_string_lossy());
     match event {
         ProgressEvent::Log(level, msg) => match level {
-            LogLevel::Info => log::info!("{}", msg),
-            LogLevel::Warn => log::warn!("{}", msg),
-            LogLevel::Error => log::error!("{}", msg),
+            LogLevel::Info => log::info!("{}{}", prefix, msg),
+            LogLevel::Warn => log::warn!("{}{}", prefix, msg),
+            LogLevel::Error => log::error!("{}{}", prefix, msg),
         },
         ProgressEvent::FileStarted { .. }
         | ProgressEvent::PartitionsFound { .. }
         | ProgressEvent::PartitionStarted { .. } => {}
         ProgressEvent::OutputGenerated { path } => {
-            log::info!("Output: {}", path);
+            log::info!("{}Output: {}", prefix, path);
         }
         ProgressEvent::PartitionError { index, error } => {
-            log::warn!("Error remuxing partition #{}: {}", index, error);
+            log::warn!("{}Error remuxing partition #{}: {}", prefix, index, error);
         }
         ProgressEvent::FileCompleted { .. } => {}
     }
@@ -224,19 +240,20 @@ impl std::fmt::Display for DeferredError {
     }
 }
 
-fn remux_cli(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    let mut errors: Vec<DeferredError> = Vec::new();
+fn remux_cli(args: &Args) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let errors: Mutex<Vec<DeferredError>> = Mutex::new(Vec::new());
     let files = expand_globs(&args.files);
     let config = args_to_config(args);
 
-    for ubv_path in &files {
-        if let Err(e) = process_file(args, &config, ubv_path, &mut errors)
-            && args.fail_fast
-        {
-            return Err(e);
+    files.par_iter().try_for_each(|ubv_path| {
+        let res = process_file(args, &config, ubv_path, &errors);
+        if args.fail_fast && res.is_err() {
+            return Err(res.unwrap_err());
         }
-    }
+        Ok(())
+    })?;
 
+    let errors = errors.into_inner().unwrap();
     if !errors.is_empty() {
         log::error!("");
         log::error!("OPERATION COMPLETED WITH ERRORS:");
@@ -255,10 +272,10 @@ fn process_file(
     args: &Args,
     config: &RemuxConfig,
     ubv_path: &str,
-    errors: &mut Vec<DeferredError>,
-) -> Result<(), Box<dyn std::error::Error>> {
+    errors: &Mutex<Vec<DeferredError>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let result = remux_lib::process_file(ubv_path, config, &mut |event| {
-        log_progress(event);
+        log_progress(ubv_path, event);
     });
 
     match result {
@@ -268,7 +285,7 @@ fn process_file(
                     log::error!("{}", err_msg);
                 } else {
                     // Parse the error message to extract partition number
-                    errors.push(DeferredError::Inspect {
+                    errors.lock().unwrap().push(DeferredError::Inspect {
                         file: ubv_path.to_string(),
                         error: err_msg.clone(),
                     });
@@ -285,7 +302,7 @@ fn process_file(
                 log::error!("{}: {}", ubv_path, msg);
             } else {
                 log::warn!("{}: {}", ubv_path, msg);
-                errors.push(DeferredError::Inspect {
+                errors.lock().unwrap().push(DeferredError::Inspect {
                     file: ubv_path.to_string(),
                     error: msg.clone(),
                 });
@@ -310,6 +327,7 @@ mod tests {
             video_track: 0,
             fail_fast: false,
             merge: false,
+            jobs: None,
             version: false,
             files: vec!["dummy.ubv".to_string()],
         }
@@ -340,10 +358,11 @@ mod tests {
     fn deferred_mode_collects_inspect_error() {
         let args = base_args();
         let config = args_to_config(&args);
-        let mut errors = Vec::new();
+        let errors = Mutex::new(Vec::new());
 
-        let result = process_file(&args, &config, "nonexistent.ubv", &mut errors);
+        let result = process_file(&args, &config, "nonexistent.ubv", &errors);
         assert!(result.is_err());
+        let errors = errors.into_inner().unwrap();
         assert_eq!(errors.len(), 1);
         let DeferredError::Inspect { file, error } = &errors[0];
         assert_eq!(file, "nonexistent.ubv");
@@ -355,12 +374,12 @@ mod tests {
         let mut args = base_args();
         args.fail_fast = true;
         let config = args_to_config(&args);
-        let mut errors = Vec::new();
+        let errors = Mutex::new(Vec::new());
 
-        let result = process_file(&args, &config, "nonexistent.ubv", &mut errors);
+        let result = process_file(&args, &config, "nonexistent.ubv", &errors);
         assert!(result.is_err());
         assert!(
-            errors.is_empty(),
+            errors.into_inner().unwrap().is_empty(),
             "fail-fast should not push deferred errors"
         );
     }
@@ -369,13 +388,14 @@ mod tests {
     fn deferred_mode_continues_past_failures() {
         let args = base_args();
         let config = args_to_config(&args);
-        let mut errors = Vec::new();
+        let errors = Mutex::new(Vec::new());
 
         let paths = vec!["nonexistent_a.ubv", "nonexistent_b.ubv"];
         for path in &paths {
-            let _ = process_file(&args, &config, path, &mut errors);
+            let _ = process_file(&args, &config, path, &errors);
         }
 
+        let errors = errors.into_inner().unwrap();
         // Both files should have produced an error
         assert_eq!(errors.len(), 2);
         let DeferredError::Inspect { file, .. } = &errors[0];
