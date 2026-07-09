@@ -1,0 +1,98 @@
+name: Release (Linux GUI)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to attach assets to (leave empty for build-only test)"
+        required: false
+
+permissions:
+  contents: write
+  checks: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            rid: linux-x64
+            artifact: gui-linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            rid: linux-arm64
+            artifact: gui-linux-aarch64
+
+    name: ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential nasm pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            release-${{ matrix.target }}-
+
+      - name: Build release binaries
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build C# GUI
+        run: |
+          NATIVE_DIR="ui/RemuxGui/native/${{ matrix.rid }}"
+          mkdir -p "$NATIVE_DIR"
+          cp target/${{ matrix.target }}/release/libremux_ffi.so "$NATIVE_DIR/"
+          
+          dotnet publish ui/RemuxGui/RemuxGui.csproj -c Release -r ${{ matrix.rid }} --self-contained -o publish/${{ matrix.rid }}
+
+      - name: Package
+        run: |
+          mkdir -p staging
+          cp -r publish/${{ matrix.rid }}/* staging/
+          cp ui/installer/cli-readme.txt staging/README.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: staging/
+
+      - name: Determine release tag
+        id: tag
+        run: echo "tag=${{ github.event.release.tag_name || inputs.tag }}" >> "$GITHUB_OUTPUT"
+
+      - name: Create release archive
+        if: steps.tag.outputs.tag != ''
+        run: tar czf ${{ matrix.artifact }}.tar.gz -C staging .
+
+      - name: Upload release asset
+        if: steps.tag.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ steps.tag.outputs.tag }}" ${{ matrix.artifact }}.tar.gz

@@ -30,4 +30,7 @@ public class RemuxConfig
     [JsonPropertyName("base_name")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? BaseName { get; set; }
+
+    [JsonPropertyName("merge")]
+    public bool Merge { get; set; } = false;
 }

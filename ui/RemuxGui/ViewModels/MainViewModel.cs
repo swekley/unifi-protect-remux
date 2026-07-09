@@ -93,6 +93,12 @@ public partial class MainViewModel : ViewModelBase
     [ObservableProperty]
     private decimal _videoTrack;
 
+    [ObservableProperty]
+    private bool _merge;
+
+    [ObservableProperty]
+    private decimal _jobs = 0; // 0 = Auto (Environment.ProcessorCount)
+
     private CancellationTokenSource? _cts;
 
     public bool IsBusy => IsProcessing || IsDiagnosticsProcessing;
@@ -307,6 +313,7 @@ public partial class MainViewModel : ViewModelBase
             OutputFolder = OutputFolder,
             Mp4 = Mp4Output,
             VideoTrack = (ushort)Math.Clamp(VideoTrack, 0, 65535),
+            Merge = Merge,
         };
     }
 
@@ -350,12 +357,22 @@ public partial class MainViewModel : ViewModelBase
         {
             RemuxNative.Init();
 
-            for (int i = 0; i < filePaths.Count; i++)
+            var parallelOptions = new ParallelOptions
             {
-                if (token.IsCancellationRequested)
-                    break;
+                MaxDegreeOfParallelism = Jobs <= 0 ? Environment.ProcessorCount : (int)Jobs,
+                CancellationToken = token
+            };
 
-                ProcessSingleFile(filePaths[i], config, i, baseNames[i]);
+            try
+            {
+                Parallel.For(0, filePaths.Count, parallelOptions, (i, state) =>
+                {
+                    ProcessSingleFile(filePaths[i], config, i, baseNames[i]);
+                });
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected when canceled
             }
         });
 
@@ -399,9 +416,13 @@ public partial class MainViewModel : ViewModelBase
         IsProcessing = false;
     }
 
-    private void ProcessSingleFile(string path, RemuxConfig config, int fileIndex, string? baseName = null)
+    private void ProcessSingleFile(string path, RemuxConfig baseConfig, int fileIndex, string? baseName = null)
     {
+        // Clone config to ensure thread-safety when modifying BaseName
+        var configJson = JsonSerializer.Serialize(baseConfig, AppJsonContext.Default.RemuxConfig);
+        var config = JsonSerializer.Deserialize(configJson, AppJsonContext.Default.RemuxConfig)!;
         config.BaseName = baseName;
+
         ProgressCallback callback = (jsonPtr, idx) =>
         {
             if (jsonPtr == IntPtr.Zero) return;

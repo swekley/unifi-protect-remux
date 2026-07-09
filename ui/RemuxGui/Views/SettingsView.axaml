@@ -101,6 +101,15 @@
                                 <TextBlock Text="Move moov atom to front for streaming" Classes="setting-desc" />
                             </StackPanel>
                         </DockPanel>
+
+                        <DockPanel>
+                            <ToggleSwitch DockPanel.Dock="Right" IsChecked="{Binding Merge}"
+                                          VerticalAlignment="Center" />
+                            <StackPanel VerticalAlignment="Center">
+                                <TextBlock Text="Merge partitions" Classes="setting-label" />
+                                <TextBlock Text="Merge per-partition outputs into single MP4" Classes="setting-desc" />
+                            </StackPanel>
+                        </DockPanel>
                     </StackPanel>
                 </Border>
 
@@ -149,6 +158,13 @@
                             <TextBlock Text="Video track" Classes="setting-label" />
                             <TextBlock Text="Select specific video track (0 = auto)" Classes="setting-desc" />
                             <NumericUpDown Value="{Binding VideoTrack}" Minimum="0" Maximum="65535"
+                                           FormatString="0" Increment="1" Margin="0,4,0,0" />
+                        </StackPanel>
+
+                        <StackPanel Spacing="4">
+                            <TextBlock Text="Parallel jobs" Classes="setting-label" />
+                            <TextBlock Text="Number of files to process simultaneously (0 = auto)" Classes="setting-desc" />
+                            <NumericUpDown Value="{Binding Jobs}" Minimum="0" Maximum="128"
                                            FormatString="0" Increment="1" Margin="0,4,0,0" />
                         </StackPanel>
                     </StackPanel>
