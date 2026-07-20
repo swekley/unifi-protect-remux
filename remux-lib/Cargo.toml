@@ -13,6 +13,7 @@ libc = "0.2"
 log = "0.4"
 ffmpeg-next = "8"
 ffmpeg-sys-next = "8"
+sysinfo = "0.33"
 
 [dev-dependencies]
 # Bitstream md5 verification in tests/reference_testsrc2.rs.

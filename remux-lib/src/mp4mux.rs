@@ -1,7 +1,8 @@
 use std::fs::File;
-use std::io;
-use std::sync::Once;
+use std::io::{self, Write, IsTerminal};
+use std::sync::{Once, OnceLock, Mutex};
 
+use sysinfo::Disks;
 extern crate ffmpeg_next as ffmpeg;
 extern crate ffmpeg_sys_next as ffi;
 use ffmpeg::{Rational, codec, encoder, format};
@@ -202,6 +203,77 @@ fn compute_dts_duration(dts_values: &[u64], index: usize) -> (i64, i64) {
     (dts, duration)
 }
 
+static PROMPT_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn prompt_mutex() -> &'static Mutex<()> {
+    PROMPT_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+fn check_disk_space_and_prompt(out_file: &str, disks_cache: &mut Disks) -> io::Result<()> {
+    let out_path = match std::path::Path::new(out_file).canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            if let Some(parent) = std::path::Path::new(out_file).parent() {
+                parent.canonicalize().unwrap_or_else(|_| std::path::PathBuf::from(out_file))
+            } else {
+                std::path::PathBuf::from(out_file)
+            }
+        }
+    };
+
+    let check_critical = |disks: &mut Disks| -> Option<(String, u64)> {
+        disks.refresh(true);
+        let mut max_prefix_len = 0;
+        let mut critical_info = None;
+
+        for disk in disks.iter() {
+            if out_path.starts_with(disk.mount_point()) {
+                let len = disk.mount_point().as_os_str().len();
+                if len >= max_prefix_len {
+                    max_prefix_len = len;
+                    let total = disk.total_space();
+                    let available = disk.available_space();
+                    if total > 0 && available * 100 / total < 5 {
+                        critical_info = Some((disk.mount_point().display().to_string(), available));
+                    } else {
+                        critical_info = None;
+                    }
+                }
+            }
+        }
+        critical_info
+    };
+
+    if let Some((mount_point_display, _)) = check_critical(disks_cache) {
+        if io::stdin().is_terminal() {
+            let _lock = prompt_mutex().lock().unwrap();
+            
+            if let Some((_, avail)) = check_critical(disks_cache) {
+                log::warn!("Critical disk space (< 5% left) detected on {}.", mount_point_display);
+                loop {
+                    print!("Free disk space is getting critical ({} bytes left). Do you want to continue? (Y/n) ", avail);
+                    let _ = io::stdout().flush();
+                    let mut input = String::new();
+                    if io::stdin().read_line(&mut input).is_ok() {
+                        let input = input.trim().to_lowercase();
+                        if input == "y" || input.is_empty() {
+                            break;
+                        } else if input == "n" {
+                            return Err(io::Error::new(io::ErrorKind::Other, "No space left on device"));
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else {
+            log::warn!("Critical disk space (< 5% left) detected on {} but not running in a terminal, proceeding anyway.", mount_point_display);
+        }
+    }
+    
+    Ok(())
+}
+
 /// Stream UBV frames directly to MP4 without intermediate files.
 ///
 /// Probes codec parameters from the first few frames via AVIO, then reads each
@@ -216,6 +288,7 @@ pub fn stream_to_mp4(
     fast_start: bool,
 ) -> io::Result<()> {
     ensure_init();
+    let mut disks_cache = Disks::new();
 
     let video_track = match &partition.video_track {
         Some(t) if t.frame_count > 0 => t,
@@ -363,6 +436,9 @@ pub fn stream_to_mp4(
             log::info!("Video: CFR {} fps (forced)", nominal_fps);
             let video_tb = Rational(rate.denominator(), rate.numerator());
             for (i, frame) in video_frames.iter().enumerate() {
+                if i > 0 && i % 1000 == 0 {
+                    check_disk_space_and_prompt(mp4_file, &mut disks_cache)?;
+                }
                 crate::demux::read_video_frame(
                     &mut ubv_file,
                     frame,
@@ -406,6 +482,9 @@ pub fn stream_to_mp4(
             let input_tb = Rational(1, video_track.clock_rate as i32);
             let dts_values = &video_track.dts_values;
             for (i, frame) in video_frames.iter().enumerate() {
+                if i > 0 && i % 1000 == 0 {
+                    check_disk_space_and_prompt(mp4_file, &mut disks_cache)?;
+                }
                 if i >= dts_values.len() {
                     log::warn!(
                         "More video frames ({}) than DTS values ({})",
@@ -471,6 +550,9 @@ pub fn stream_to_mp4(
                 at.frame_count
             );
             for (i, frame) in audio_frames.iter().enumerate() {
+                if i > 0 && i % 1000 == 0 {
+                    check_disk_space_and_prompt(mp4_file, &mut disks_cache)?;
+                }
                 crate::demux::read_audio_frame_raw(&mut ubv_file, frame, &mut audio_buf).map_err(
                     |e| {
                         io::Error::new(
@@ -507,6 +589,9 @@ pub fn stream_to_mp4(
                 at.frame_count
             );
             for (i, frame) in audio_frames.iter().enumerate() {
+                if i > 0 && i % 1000 == 0 {
+                    check_disk_space_and_prompt(mp4_file, &mut disks_cache)?;
+                }
                 if i >= dts_values.len() {
                     log::warn!(
                         "More audio frames ({}) than DTS values ({})",
